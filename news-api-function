@@ -1,0 +1,342 @@
+"""
+Current API Key credentials is a Free Tier. 
+So the 'from_date' and 'end_date' wouldn't not work.
+
+In order to use set the FREE_TIER variable to False and get an API Key that's paid version.
+
+"""
+
+
+import json
+import os
+import boto3
+from datetime import datetime
+from urllib.parse import urlencode
+from urllib.request import urlopen, Request
+from urllib.error import HTTPError, URLError
+
+# Initialize S3 client
+s3_client = boto3.client('s3')
+
+# Configuration
+S3_BUCKET = os.environ.get('S3_BUCKET_NAME', 'newsapi.bucket')
+NEWS_API_KEY = os.environ.get('NEWS_API_KEY')  # Get from environment variable
+NEWS_API_BASE_URL = 'https://newsapi.org/v2/everything'
+
+
+# Set to False when a paid API KEY is used
+FREE_TIER = True
+
+# South African news domains
+SA_NEWS_DOMAINS = [
+    'news24.com',
+    'iol.co.za',
+    'dailymaverick.co.za',
+    'timeslive.co.za',
+    'citizen.co.za',
+    'corruptionwatch.org.za',
+    'sundayworld.co.za',
+    'mg.co.za',
+    'dailyvoice.co.za',
+    'sowetanlive.co.za'
+]
+
+# Keywords for suspicious activity
+SEARCH_KEYWORDS = [
+    'corruption',
+    'fraud',
+    'bribery',
+    'theft',
+    'scandal',
+    'money laundering',
+    'embezzlement',
+    'kickback',
+    'investigation'
+]
+
+
+def build_search_query(person_name, keywords=None):
+    """
+    Build a search query combining person name and keywords.
+    
+    Args:
+        person_name (str): Name of the person to search for
+        keywords (list): List of keywords to include (defaults to SEARCH_KEYWORDS)
+    
+    Returns:
+        str: Combined search query
+    """
+    if keywords is None:
+        keywords = SEARCH_KEYWORDS
+    
+    # Combine person name with keywords
+    keyword_string = ' OR '.join(keywords)
+    query = f"{person_name} AND ({keyword_string})"
+    
+    return query
+
+
+def fetch_news_articles(query, from_date, to_date, domains, api_key, max_pages=5):
+    """
+    Fetch news articles from NewsData.io API with pagination.
+    
+    Args:
+        query (str): Search query
+        from_date (str): Start date in YYYY-MM-DD format
+        to_date (str): End date in YYYY-MM-DD format
+        domains (list): List of domains to search
+        api_key (str): NewsData.io API key
+        max_pages (int): Maximum number of pages to fetch
+    
+    Returns:
+        list: List of all fetched articles
+    """
+    all_articles = []
+    next_page = None
+    page_count = 0
+    
+    while page_count < max_pages:
+        try:
+            # Build API parameters
+            params = {
+                'apiKey': api_key,
+                'q': query,
+                'domains': ','.join(domains),
+                'language': 'en',
+            }
+            
+            # Add pagination token if available
+            if next_page:
+                params['page'] = next_page
+
+            if not FREE_TIER:
+                params['from'] = from_date
+                params['to'] = to_date
+            
+            # Construct URL
+            url = f"{NEWS_API_BASE_URL}?{urlencode(params)}"
+            
+            # Make API request
+            request = Request(url)
+            request.add_header('User-Agent', 'Mozilla/5.0')
+            
+            with urlopen(request, timeout=30) as response:
+                data = json.loads(response.read().decode())
+            
+            # Check response status
+            if data.get('status') != 'ok':
+                print(f"API Error: {data.get('message', 'Unknown error')}")
+                break
+            
+            # Extract articles
+            results = data.get('articles', [])
+            if not results:
+                print("No more articles found")
+                break
+            
+            all_articles.extend(results)
+            print(f"Fetched {len(results)} articles (Page {page_count + 1})")
+            
+            # Check for next page
+            next_page = data.get('nextPage')
+            if not next_page:
+                print("No more pages available")
+                break
+            
+            page_count += 1
+            
+        except HTTPError as e:
+            print(f"HTTP Error: {e.code} - {e.reason}")
+            break
+        except URLError as e:
+            print(f"URL Error: {e.reason}")
+            break
+        except Exception as e:
+            print(f"Unexpected error: {str(e)}")
+            break
+    
+    return all_articles
+
+
+def save_to_s3(articles, person_name, bucket_name):
+    """
+    Save articles to S3 as JSON file.
+    
+    Args:
+        articles (list): List of articles to save
+        person_name (str): Name of the person (used in key)
+        bucket_name (str): S3 bucket name
+    
+    Returns:
+        dict: Response containing S3 key and upload status
+    """
+    try:
+        # Generate timestamp
+        timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+        
+        # Sanitize person name for use in S3 key
+        sanitized_name = person_name.lower().replace(' ', '_')
+        
+        # Create S3 key
+        s3_key = f"news-results/{sanitized_name}/{timestamp}.json"
+        
+        # Prepare data to save
+        save_data = {
+            'person_name': person_name,
+            'search_timestamp': timestamp,
+            'total_articles': len(articles),
+            'articles': articles
+        }
+        
+        # Upload to S3
+        s3_client.put_object(
+            Bucket=bucket_name,
+            Key=s3_key,
+            Body=json.dumps(save_data, indent=2),
+            ContentType='application/json'
+        )
+        
+        print(f"Successfully saved {len(articles)} articles to s3://{bucket_name}/{s3_key}")
+        
+        return {
+            'success': True,
+            's3_key': s3_key,
+            'article_count': len(articles)
+        }
+        
+    except Exception as e:
+        print(f"Error saving to S3: {str(e)}")
+        return {
+            'success': False,
+            'error': str(e)
+        }
+
+
+def process_result(articles , keywords):
+    """
+    Process fetched articles to extract relevant information.
+    
+    Args:
+        articles (list): List of fetched articles
+    
+    Returns:
+        list: Processed list of articles with selected fields
+    """
+    processed_articles = []
+    
+    for article in articles:
+        processed_article = {
+            'resource_id' : uuid.uuid4(),
+            'keywords' : '• \n'.join(['Entities' , *keywords]),
+            'title': article.get('title'),
+            'url': article.get('link'),
+            'pubDate': article.get('publishedAt'),
+            'source_name': article.get('source'),
+            'content' : article.get('content'),
+            'description': article.get('description')
+        }
+        processed_articles.append(processed_article)
+    
+    return processed_articles
+
+
+
+def lambda_handler(event, context):
+    """
+    AWS Lambda handler function.
+    
+    Expected event structure:
+    {
+        "person_name": "John Doe",
+        "from_date": "2024-01-01",
+        "to_date": "2024-12-31",
+        "keywords": ["corruption", "fraud"],  # Optional
+        "max_pages": 5  # Optional
+    }
+    """
+    try:
+        # Validate API key
+        if not NEWS_API_KEY:
+            return {
+                'statusCode': 500,
+                'body': json.dumps({
+                    'error': 'NEWS_API_KEY environment variable not set'
+                })
+            }
+        
+        # Extract parameters from event
+        person_name = event.get('person_name')
+        from_date = event.get('from_date')
+        to_date = event.get('to_date')
+        domains = event.get('domains' , [])
+        keywords = event.get('keywords', SEARCH_KEYWORDS)
+        max_pages = event.get('max_pages', 5)
+        
+        # Validate required parameters
+        if not all([person_name]):
+            return {
+                'statusCode': 400,
+                'body': json.dumps({
+                    'error': 'Missing required parameters: person_name, from_date, to_date'
+                })
+            }
+        
+        print(f"Searching for: {person_name}")
+        print(f"Date range: {from_date} to {to_date}")
+        
+        # Build search query
+        query = build_search_query(person_name, keywords)
+        print(f"Search query: {query}")
+        
+        # Fetch articles
+        articles = fetch_news_articles(
+            query=query,
+            from_date=from_date,
+            to_date=to_date,
+            domains=domains,
+            api_key=NEWS_API_KEY,
+            max_pages=max_pages
+        )
+        
+        if not articles:
+            return {
+                'statusCode': 200,
+                'body': json.dumps({
+                    'message': 'No articles found',
+                    'person_name': person_name,
+                    'article_count': 0
+                })
+            }
+        
+        # Save to S3
+        save_result = save_to_s3(articles, person_name, S3_BUCKET)
+        
+        if save_result['success']:
+            return {
+                'statusCode': 200,
+                'body': json.dumps({
+                    'message': 'Successfully processed news search',
+                    'person_name': person_name,
+                    'article_count': save_result['article_count'],
+                    's3_key': save_result['s3_key']
+                })
+            }
+        else:
+            return {
+                'statusCode': 500,
+                'body': json.dumps({
+                    'error': 'Failed to save results to S3',
+                    'details': save_result.get('error')
+                })
+            }
+        
+    except Exception as e:
+        print(f"Lambda execution error: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({
+                'error': 'Internal server error',
+                'details': str(e)
+            })
+        }
+
