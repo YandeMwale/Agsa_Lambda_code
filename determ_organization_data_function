@@ -1,0 +1,155 @@
+import json
+import boto3
+import requests
+from datetime import datetime
+from typing import Dict, List, Optional
+import os
+
+# Initialize S3 client
+s3_client = boto3.client('s3')
+
+S3_BUCKET = os.environ.get('S3_BUCKET_NAME', 'determ.bucket')
+ACCESS_TOKEN = os.environ.get('ACCESS_TOKEN')  # Get from environment variable
+
+def lambda_handler(event, context):
+    """
+    Main Lambda handler function.
+    
+    Expected event parameters:
+    - organization_id: Organization ID for the API
+    """
+    
+    try:
+        # Extract parameters from event
+        organization_id = str(event.get('organization_id', "176478"))
+        s3_prefix = 'organizations_data'
+        
+        
+        # Fetch all organization details using organization id
+        organization_data = fetch_organization_data(
+            organization_id=organization_id,
+            access_token=ACCESS_TOKEN
+        )
+        
+        
+        # Upload to S3
+        s3_key = upload_to_s3(
+            data=organization_data,
+            organization_id=organization_id,
+            bucket=S3_BUCKET,
+            prefix=s3_prefix
+        )
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message': 'Successfully fetched and uploaded organization details',
+                's3_location': f's3://{S3_BUCKET}/{s3_key}'
+            })
+        }
+        
+    except Exception as e:
+        print(f"Error in lambda_handler: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({
+                'error': str(e)
+            })
+        }
+
+
+def fetch_organization_data(
+    organization_id: str,
+    access_token: str
+) -> Dict:
+    """
+    Fetch all details from given organization id
+    
+    Returns:
+        Dict of all organization detail
+    """
+    base_url = f'http://api.mediatoolkit.com/v2/organizations/{organization_id}'
+        
+    # Make API request
+    headers = {
+        'Content-Type': 'application/json'
+    }
+        
+    params = {
+        'access_token': access_token
+    }
+        
+    try:
+        response = requests.get(
+            base_url,
+            headers=headers,
+            params=params,
+            timeout=30
+        )
+        
+        response.raise_for_status()
+            
+        data = response.json()
+            
+            
+    except requests.exceptions.RequestException as e:
+        print(f"API request failed: {str(e)}")
+        raise
+    
+    return data
+
+
+def upload_to_s3(
+    data: Dict,
+    organization_id : str,
+    bucket: str,
+    prefix: str
+) -> str:
+    """
+    Upload organization data to S3 as JSON.
+    
+    Args:
+        data: organization data for given id
+        organization_id: given id of organization
+        bucket: S3 bucket name
+        prefix: S3 key prefix
+        
+    Returns:
+        S3 key where data was uploaded
+    """
+
+    if not data:
+        print("No data to upload")
+        return
+
+    # Generate S3 key with timestamp
+    timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S') 
+
+    s3_key = f"{prefix}/org_{organization_id}/org_{timestamp}.json"
+    
+    # Prepare data for upload
+    upload_data = {
+        'metadata': {
+            'organization_id': organization_id,
+            'generated_at': datetime.utcnow().isoformat()
+        },
+        'data': data
+    }
+    
+    # Convert to JSON
+    json_data = json.dumps(upload_data, indent=2, ensure_ascii=False)
+    
+    # Upload to S3
+    try:
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=s3_key,
+            Body=json_data.encode('utf-8'),
+            ContentType='application/json'
+        )
+        print(f"Successfully uploaded to s3://{bucket}/{s3_key}")
+        return s3_key
+        
+    except Exception as e:
+        print(f"Failed to upload to S3: {str(e)}")
+        raise
