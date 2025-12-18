@@ -1,0 +1,302 @@
+import json
+import boto3
+import requests
+from datetime import datetime
+from typing import Dict, List, Optional
+import os
+
+# Initialize S3 client
+s3_client = boto3.client('s3')
+
+S3_BUCKET = os.environ.get('S3_BUCKET_NAME', 'determ.bucket')
+ACCESS_TOKEN = os.environ.get('ACCESS_TOKEN')  # Get from environment variable
+
+def lambda_handler(event, context):
+    """
+    Main Lambda handler function.
+    
+    Expected event parameters:
+    - organization_id: Organization ID for the API
+    - keyword_id: Keyword ID to fetch mentions for
+    - access_token: API access token
+    - date_from: Start date (ISO format: 2025-11-10T00:00:00Z)
+    - date_to: End date (ISO format: 2025-11-11T00:00:00Z)
+    - s3_bucket: Target S3 bucket name
+    - s3_prefix: (Optional) S3 key prefix/folder
+    """
+    
+    try:
+        # Extract parameters from event
+        organization_id = event.get('organization_id')
+        keyword_id = event.get('keyword_id')
+        date_from = event.get('date_from')
+        date_to = event.get('date_to')
+        s3_prefix = event.get('s3_prefix', 'mediatoolkit_mentions')
+
+        if not all([organization_id, keyword_id, date_from, date_to]):
+            raise ValueError("Missing required parameters")
+        
+        # Fetch all mentions using scroll API
+        all_mentions = fetch_all_mentions(
+            organization_id=organization_id,
+            keyword_id=keyword_id,
+            access_token=ACCESS_TOKEN,
+            date_from=date_from,
+            date_to=date_to
+        )
+        
+        # Process the mentions
+        processed_data = process_mentions(all_mentions)
+        
+        # Upload to S3
+        s3_key = upload_to_s3(
+            data=processed_data,
+            organization_id=organization_id,
+            bucket=S3_BUCKET,
+            prefix=s3_prefix,
+            keyword_id=keyword_id,
+            date_from=date_from,
+            date_to=date_to
+        )
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message': 'Successfully processed and uploaded mentions',
+                'total_mentions': len(all_mentions),
+                's3_location': f's3://{S3_BUCKET}/{s3_key}',
+                'processed_records': len(processed_data)
+            })
+        }
+        
+    except Exception as e:
+        print(f"Error in lambda_handler: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({
+                'error': str(e)
+            })
+        }
+
+
+def fetch_all_mentions(
+    organization_id: str,
+    keyword_id: str,
+    access_token: str,
+    date_from: str,
+    date_to: str
+) -> List[Dict]:
+    """
+    Fetch all mentions using the scroll API pattern.
+    
+    Returns:
+        List of all mention dictionaries
+    """
+    base_url = f'http://api.mediatoolkit.com/v2/organization/{organization_id}/keyword/{keyword_id}/mentions/scroll'
+    
+    all_mentions = []
+    scroll_token = None
+    batch_count = 0
+    
+    while True:
+        batch_count += 1
+        print(f"Fetching batch {batch_count}...")
+        
+        # Prepare request payload
+        payload = {
+            "query": {
+                "feedTime": {
+                    "from": date_from,
+                    "to": date_to
+                }
+            },
+             "includeFullText":True,
+            "paged": {
+                "count": 1000,
+                "sorted": {
+                    "direction": "ASC",
+                    "property": "FEED_TIME"
+                }
+            },
+            "scrollToken": scroll_token
+        }
+        
+        # Make API request
+        headers = {
+            'Content-Type': 'application/json'
+        }
+        
+        params = {
+            'access_token': access_token
+        }
+        
+        try:
+            response = requests.post(
+                base_url,
+                headers=headers,
+                params=params,
+                json=payload,
+                timeout=30
+            )
+            response.raise_for_status()
+            
+            data = response.json()
+            
+            # Extract mentions from response
+            mentions = data.get('mentions', [])
+            all_mentions.extend(mentions)
+            
+            print(f"Batch {batch_count}: Retrieved {len(mentions)} mentions")
+            
+            # Get new scroll token
+            new_scroll_token = data.get('scrollToken')
+            
+            # If no new scroll token, we've reached the end
+            if not new_scroll_token:
+                print("No more data to fetch")
+                break
+            
+            scroll_token = new_scroll_token
+            
+        except requests.exceptions.RequestException as e:
+            print(f"API request failed: {str(e)}")
+            raise
+    
+    print(f"Total mentions retrieved: {len(all_mentions)}")
+    return all_mentions
+
+
+def convert_timestamp_to_datestring(timestamp : Optional[int]) -> str:
+    
+    """
+    Convert UNIX timestamp to YYYY-MM-DD date string.
+    
+    Args:
+        timestamp (int): UNIX timestamp
+    
+    Returns:
+        str: Date string in YYYY-MM-DD format
+    """
+    
+    if not timestamp:
+        return None
+
+    if isinstance(timestamp, str):
+        timestamp = int(timestamp)
+    
+    return datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d')   
+
+def process_mentions(mentions: List[Dict]) -> List[Dict]:
+    """
+    Process the raw mentions data into a structured format.
+    
+    Args:
+        mentions: List of raw mention dictionaries
+        
+    Returns:
+        List of processed mention dictionaries
+    """
+    processed = []
+    
+    for mention in mentions:
+        try:
+            # Extract and structure the key fields
+            processed_mention = {
+                'id': mention.get('id'),
+                'title': mention.get('title', ''),
+                'mention': mention.get('mention', ''),
+                'url': mention.get('url', ''),
+                'published_time': convert_timestamp_to_datestring(mention.get('insertTime')),
+                'source_name': mention.get('from', ''),
+                'source_type': mention.get('type', ''),
+                'author': mention.get('author', ''),
+                'reach': mention.get('reach', 0),
+                'virality'  : mention.get('virality', 0),
+                'sentiment': mention.get('autoSentiment', ''),
+                'language': ', '.join(mention.get('languages', [])),
+                'locations': ', '.join(mention.get('locations', [])),
+                'tags': mention.get('tags', []),
+                'score': mention.get('score', 0),
+                'description': mention.get('description', ''),
+                'keywords': '• \n'.join(['Entities Keywords' , *mention.get('keywords')]) if mention.get('keywords', []) else [] ,
+            
+                'processed_at': datetime.utcnow().isoformat(),
+                'full_text': mention.get('fullText', '')
+            }
+            
+            processed.append(processed_mention)
+            
+        except Exception as e:
+            print(f"Error processing mention {mention.get('id', 'unknown')}: {str(e)}")
+            continue
+    
+    return processed
+
+
+def upload_to_s3(
+    data: List[Dict],
+    organization_id : str,
+    bucket: str,
+    prefix: str,
+    keyword_id: str,
+    date_from: str,
+    date_to: str
+) -> str:
+    """
+    Upload processed data to S3 as JSON.
+    
+    Args:
+        data: Processed mentions data
+        bucket: S3 bucket name
+        prefix: S3 key prefix
+        keyword_id: Keyword ID for naming
+        date_from: Start date for naming
+        date_to: End date for naming
+        
+    Returns:
+        S3 key where data was uploaded
+    """
+
+    if not data:
+        print("No data to upload")
+        return
+
+    # Generate S3 key with timestamp
+    timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+    date_from = datetime.fromisoformat(date_from.replace('Z', '+00:00')).strftime('%Y%m%d_%H%M%S')
+    date_to = datetime.fromisoformat(date_to.replace('Z', '+00:00')).strftime('%Y%m%d_%H%M%S')  
+
+    date_range = f"{date_from}_to_{date_to}"
+    s3_key = f"{prefix}/org_{organization_id}_keyword_{keyword_id}/{date_range}/mentions_{timestamp}.json"
+    
+    # Prepare data for upload
+    upload_data = {
+        'metadata': {
+            'keyword_id': keyword_id,
+            'date_from': date_from,
+            'date_to': date_to,
+            'total_mentions': len(data),
+            'generated_at': datetime.utcnow().isoformat()
+        },
+        'mentions': data
+    }
+    
+    # Convert to JSON
+    json_data = json.dumps(upload_data, indent=2, ensure_ascii=False)
+    
+    # Upload to S3
+    try:
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=s3_key,
+            Body=json_data.encode('utf-8'),
+            ContentType='application/json'
+        )
+        print(f"Successfully uploaded to s3://{bucket}/{s3_key}")
+        return s3_key
+        
+    except Exception as e:
+        print(f"Failed to upload to S3: {str(e)}")
+        raise
+
+
