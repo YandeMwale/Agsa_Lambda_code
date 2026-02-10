@@ -1,0 +1,212 @@
+import json
+import os
+import boto3
+import psycopg2
+import hashlib
+from urllib.parse import urlparse
+
+REGION = "af-south-1"
+BUCKET = os.environ["BUCKET"]
+PREFIX = "research/"
+HOST = os.environ["DB_HOST"]
+PORT = 5432
+USERNAME = os.environ["DB_USER"]
+DB_NAME = "agsa-content"
+
+
+
+session = boto3.Session(region_name=REGION)
+
+rds = session.client("rds")
+s3 = session.client("s3")
+
+
+token = rds.generate_db_auth_token(
+      DBHostname=HOST,
+      Port=PORT,
+      DBUsername=USERNAME,
+)
+
+DB_CONFIG = {
+    "host": HOST,
+    "port": PORT,
+    "user": USERNAME,
+    "password": token,
+    "database": DB_NAME,
+    "sslmode": "require"
+}
+
+
+# -------------------------
+# Helpers
+# -------------------------
+
+def extract_source(url):
+    try:
+        return urlparse(url).netloc
+    except:
+        return None
+
+
+def content_hash(text):
+    if not text:
+        return None
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def get_db():
+    return psycopg2.connect(**DB_CONFIG)
+
+
+# -------------------------
+# S3 Listing
+# -------------------------
+
+def get_all_json_files():
+    keys = []
+    paginator = s3.get_paginator("list_objects_v2")
+
+    for page in paginator.paginate(Bucket=BUCKET, Prefix=PREFIX):
+        for obj in page.get("Contents", []):
+            k = obj["Key"]
+            if k.endswith(".json") or k.endswith(".jsonl"):
+                keys.append(k)
+
+    return keys
+
+
+# -------------------------
+# DB Dedup Checks
+# -------------------------
+
+def file_already_processed(cur, key):
+    cur.execute(
+        "SELECT 1 FROM processed_research_files WHERE s3_key=%s",
+        (key,)
+    )
+    return cur.fetchone() is not None
+
+
+def mark_file_processed(cur, key):
+    cur.execute(
+        "INSERT INTO processed_research_files(s3_key) VALUES (%s)",
+        (key,)
+    )
+
+
+# -------------------------
+# Inserts
+# -------------------------
+
+def upsert_keyword(cur, name):
+    if not name:
+        return
+
+    cur.execute("""
+        INSERT INTO KeywordDTO(keyword, usage_count)
+        VALUES (%s,1)
+        ON CONFLICT(keyword)
+        DO UPDATE SET
+            usage_count = KeywordDTO.usage_count + 1,
+            updated_at = NOW()
+    """, (name.lower().strip(),))
+
+
+def insert_article(cur, row):
+
+    url = row.get("url")
+    if not url:
+        return
+
+    hash_val = content_hash(row.get("content"))
+
+    score = row.get("score")
+    risk_score = round(score * 10, 2) if score else None
+
+    scanned_at = row.get("research_date")
+
+    cur.execute("""
+        INSERT INTO MediaArticleDTO(
+            title,
+            source,
+            content,
+            url,
+            published_at,
+            scanned_at,
+            risk_score,
+            summary,
+            entities,
+            keywords_used,
+            other_individuals,
+            content_hash
+        )
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT (url) DO NOTHING
+    """, (
+        row.get("title"),
+        extract_source(url),
+        row.get("content"),
+        url,
+        scanned_at,      # published_at fallback
+        scanned_at,
+        risk_score,
+        None,            # summary not available
+        None,            # entities not available
+        row.get("individual_name"),
+        None,
+        hash_val
+    ))
+
+
+# -------------------------
+# Main Handler
+# -------------------------
+
+def lambda_handler(event, context):
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    files = get_all_json_files()
+
+    processed_files = 0
+    inserted_rows = 0
+
+    for key in files:
+
+        if file_already_processed(cur, key):
+            print("Skipping processed:", key)
+            continue
+
+        print("Processing:", key)
+
+        obj = s3.get_object(Bucket=BUCKET, Key=key)
+        body = obj["Body"].read().decode("utf-8")
+
+        for line in body.splitlines():
+
+            if not line.strip():
+                continue
+
+            try:
+                data = json.loads(line)
+            except Exception as e:
+                print("Bad JSON line:", e)
+                continue
+
+            insert_article(cur, data)
+            upsert_keyword(cur, data.get("individual_name"))
+            inserted_rows += 1
+
+        mark_file_processed(cur, key)
+        processed_files += 1
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return {
+        "status": "ok",
+        "files_processed": processed_files,
+        "rows_seen": inserted_rows
+    }
