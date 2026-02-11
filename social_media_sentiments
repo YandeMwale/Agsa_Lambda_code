@@ -1,0 +1,199 @@
+import os
+import json
+import re
+import datetime as dt
+import urllib.request
+from typing import Any, Dict, List
+import logging
+logger = logging.getLogger()
+
+import boto3
+
+REGION = os.getenv("AWS_REGION", "af-south-1")
+OUTPUT_BUCKET = os.getenv("INPUT_BUCKET", "agsa-dev-source-bucket-970103398702")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "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")
+
+# Query parameters (defaults per issue request)
+QUERY = os.getenv(
+    "QUERY",
+    "Social media posts and public discussions about corruption, fraud, bribery, financial crimes, and civil misconduct involving ONLY South African government officials, South African politicians and South African public servants."
+)
+INCLUDE_ANSWER = os.getenv("INCLUDE_ANSWER", "advanced")
+SEARCH_DEPTH = os.getenv("SEARCH_DEPTH", "advanced")
+MAX_RESULTS = int(os.getenv("MAX_RESULTS", "20"))
+TIME_RANGE = os.getenv("TIME_RANGE", "year")
+INCLUDE_RAW_CONTENT = os.getenv("INCLUDE_RAW_CONTENT", "text")
+CHUNKS_PER_SOURCE = int(os.getenv("CHUNKS_PER_SOURCE", "5"))
+COUNTRY = os.getenv("COUNTRY", "south africa")
+
+s3 = boto3.client("s3", region_name=REGION)
+
+
+def _today_prefix() -> str:
+    return dt.datetime.utcnow().strftime("%Y%m%d")
+
+
+def _is_valid_date(s: str) -> bool:
+    try:
+        dt.datetime.strptime(s, "%Y-%m-%d")
+        return True
+    except Exception:
+        return False
+
+
+def _strip_html(text: str) -> str:
+    # Very basic HTML removal in case provider returns tags anyway
+    text = re.sub(r"<script[\s\S]*?</script>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"&nbsp;", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _put_s3_json(bucket: str, key: str, data: Dict[str, Any]) -> None:
+    s3.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=json.dumps(data, ensure_ascii=False).encode("utf-8"),
+        ContentType="application/json",
+        ServerSideEncryption="AES256",
+    )
+
+
+def put_results_to_s3(results: List[Dict[str, Any]], bucket: str) -> str:
+    """Store the list of results as a single JSON object in S3 under social_media_sentiments/date/timestamp.json"""
+    now = dt.datetime.utcnow()
+    date_str = now.strftime("%Y%m%d")
+    timestamp = now.strftime("%Y%m%d_%H%M%S")
+    key = f"social_media_sentiments/{date_str}/{timestamp}.json"
+    _put_s3_json(bucket, key, {"results": results})
+    return key
+
+def _filter_by_score(items: List[Dict[str, Any]], threshold: float) -> List[Dict[str, Any]]:
+    """Filter items to keep only those with a score >= threshold."""
+    return [item for item in items if float(item.get("score", 0)) >= threshold]
+
+
+def apply_score_filter(items: List[Dict[str, Any]], overrides: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Apply score-based filtering if a threshold is provided in overrides."""
+    threshold = overrides.get("score_threshold" , 0.1)
+    if threshold is not None:
+        try:
+            threshold = float(threshold)
+            logger.info(f"Applying thresholding to {len(items)} items")
+            return _filter_by_score(items, threshold)
+        except (ValueError, TypeError):
+            # If threshold is invalid, return items unfiltered
+            pass
+    return items
+
+
+def run_tavily_search(overrides: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    if not OUTPUT_BUCKET:
+        raise RuntimeError("Missing INPUT_BUCKET/OUTPUT_BUCKET env var for S3 destination")
+    if not TAVILY_API_KEY:
+        raise RuntimeError("Missing TAVILY_API_KEY env var")
+
+    overrides = overrides or {}
+
+    # Resolve overrides/envs
+    entity = overrides.get("entity") or overrides.get("ENTITY")
+    country = overrides.get("country") or overrides.get("COUNTRY") or COUNTRY
+    max_results = int(overrides.get("max_results") or overrides.get("MAX_RESULTS") or MAX_RESULTS)
+
+
+    query = QUERY
+
+    # Build search params
+    params: Dict[str, Any] = {
+        "api_key": TAVILY_API_KEY,
+        "query": query,
+        "include_answer": INCLUDE_ANSWER,
+        "search_depth": SEARCH_DEPTH,
+        "max_results": max_results,
+        "chunks_per_source": CHUNKS_PER_SOURCE,
+        "country": country,
+        "include_domains" : ["tiktok.com","linkedIn.com","facebook.com","x.com","instagram.com"]
+    }
+    # Prefer explicit date range if available; else fall back to time_range
+
+    # Execute search via HTTPS request to avoid 'tavily' package dependency
+    url = "https://api.tavily.com/search"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(params).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+
+    try:
+        with urllib.request.urlopen(req) as res:
+            response = json.loads(res.read().decode("utf-8"))
+    except Exception as e:
+        raise RuntimeError(f"Tavily API request failed: {e}")
+
+    results: List[Dict[str, Any]] = []
+    items = []
+    # Tavily may return a dict with "results" key; support common shapes
+    if isinstance(response, dict) and "results" in response:
+        items = response.get("results", []) or []
+        items = apply_score_filter(items , overrides)
+    elif isinstance(response, list):
+        items = response
+    else:
+        # store the raw response for investigation
+        items = []
+
+    #safe_entity = _safe_name(entity) if entity else "unspecified"
+    if items:
+        key = put_results_to_s3(items, OUTPUT_BUCKET)
+    
+    if items:
+        out = {
+            "status" : "Success",
+            "bucket": OUTPUT_BUCKET,
+            "s3_destination_key" : key ,
+            "result_count" : len(results),
+            "search": {
+                "query": query,
+                "country": country,
+                "max_results": max_results,
+            },
+        }
+    else:
+        out = {
+            "status" : "No Results",
+            "result_count" : len(results),
+            "search": {
+                "query": query,
+                "country": country,
+                "max_results": max_results,
+            },
+        }
+
+    return out
+
+
+def lambda_handler(event, context):
+    """Lambda entrypoint.
+    You can invoke this Lambda manually, via EventBridge schedule, or chained from another service.
+    It writes Tavily articles to S3 under social_media_sentiments/YYYYMMDDHHMMSS.json as individual JSON files.
+
+    Optional event overrides (JSON):
+    {
+      "country": "south africa",
+      "max_results": 20,
+      "query": "..."  # if you want to fully override the prompt
+    }
+    """
+    try:
+        overrides = event or {}
+        if isinstance(overrides, str):
+            try:
+                overrides = json.loads(overrides)
+            except Exception:
+                overrides = {}
+        result = run_tavily_search(overrides if isinstance(overrides, dict) else {})
+        return result
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
