@@ -1,0 +1,259 @@
+import os
+import json
+import boto3
+import logging
+from urllib.parse import unquote_plus
+
+# Configure logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Environment variables
+DB_HOST = os.getenv("DB_HOST", "agsa-dev-db-cluster.cluster-cxaiaiqu27x7.af-south-1.rds.amazonaws.com")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_USER = os.getenv("DB_USER", "agsaadmin")
+DB_NAME = os.getenv("DB_NAME", "agsa-content")
+DB_REGION = os.getenv("DB_REGION", "af-south-1")
+TABLE_NAME = os.getenv("TABLE_NAME", "social_media_articles_test")
+S3_BUCKET = os.getenv("S3_BUCKET", "agsa-dev-source-bucket-970103398702")
+S3_PREFIX = os.getenv("S3_PREFIX", "tavily_search_results/")
+
+def get_db_connection():
+    try:
+        import psycopg2
+    except ImportError:
+        logger.error("psycopg2 not found. Ensure it is included in the deployment package.")
+        raise
+
+    if not DB_HOST or not DB_USER:
+        raise ValueError("DB_HOST or DB_USER not set.")
+
+    # Generate RDS IAM auth token
+    rds = boto3.client("rds", region_name=DB_REGION)
+    try:
+        token = rds.generate_db_auth_token(
+            DBHostname=DB_HOST,
+            Port=DB_PORT,
+            DBUsername=DB_USER,
+        )
+    except Exception as e:
+        logger.error(f"Failed to generate DB auth token: {e}")
+        raise
+
+    try:
+        conn = psycopg2.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            user=DB_USER,
+            password=token,
+            dbname=DB_NAME,
+            sslmode="require"
+        )
+        return conn
+    except Exception as e:
+        logger.error(f"Failed to connect to DB: {e}")
+        raise
+
+def ensure_table_exists(conn):
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+                id SERIAL PRIMARY KEY,
+                url TEXT NOT NULL,
+                title TEXT NOT NULL,
+                content TEXT ,
+                source VARCHAR(255) NOT NULL,
+                score FLOAT,
+                published_date TIMESTAMP,
+                searched_at TIMESTAMP,
+                individuals_mentioned TEXT[],
+                keywords_used TEXT[],
+                UNIQUE(url)
+            );
+        """)
+        # Explicitly try to add column if table exists but column does not
+        
+            
+        conn.commit()
+
+def insert_into_db(conn, processed_data):
+    """
+    Insert processed data into Aurora DB.
+    """
+    query = f"""
+        INSERT INTO {TABLE_NAME} (
+            url, title, content, source, published_date, searched_at, individuals_mentioned, keywords_used, score
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (url) DO UPDATE SET
+            searched_at = EXCLUDED.searched_at,
+            content = EXCLUDED.content,
+            individuals_mentioned = EXCLUDED.individuals_mentioned,
+            keywords_used = EXCLUDED.keywords_used,
+            score = EXCLUDED.score,
+            source = EXCLUDED.source
+    """
+    
+    with conn.cursor() as cur:
+        cur.execute(query, (
+            processed_data.get("url"),
+            processed_data.get("title"),
+            processed_data.get("content"),
+            processed_data.get("source"),
+            processed_data.get("published_date"),
+            processed_data.get("searched_at"),
+            processed_data.get("individuals_mentioned"),
+            processed_data.get("keywords_used"),
+            processed_data.get("score"),
+        ))
+    conn.commit()
+
+
+
+def get_latest_s3_key(conn , individual):
+    """
+    Queries the DB to find the lexicographically largest s3_key processed so far.
+    Only considers keys that match the new date-based structure (starting with digits after prefix)
+    to avoid getting stuck behind old legacy keys (which start with letters and sort after numbers).
+    """
+    try:
+        # We look for keys that have digits immediately after the prefix.
+        # This regex assumes standard path separators.
+        # The prefix is 'tavily_search_results/', so we look for 'tavily_search_results/[0-9]'
+        query = f"SELECT MAX(searched_at) FROM {TABLE_NAME} WHERE individuals_mentioned @> ARRAY['{individual}']"
+        with conn.cursor() as cur:
+            cur.execute(query)
+            result = cur.fetchone()
+            if result and result[0]:
+                date = result[0].strftime("%Y%m%d")
+                return date
+    except Exception as e:
+        logger.warning(f"Could not fetch latest s3_key: {e}")
+    return None
+
+def fetch_new_files(s3_client, bucket, individual , last_key):
+    """
+    Lists objects in S3 that are lexicographically greater than last_key.
+    Filters out keys that do not match the expected date-based structure.
+    """
+    individual = individual.replace(" ", "_")
+    
+    paginator = s3_client.get_paginator('list_objects_v2')
+    
+    kwargs = {'Bucket': bucket, 'Prefix':  f"{S3_PREFIX}{individual}/" }
+
+
+    if last_key:
+        # StartAfter is strictly greater than
+
+        #splits = last_key.split('/')
+
+        #kwargs['Prefix'] = f"{splits[0]}/"
+        kwargs['StartAfter'] = last_key
+
+    logger.info(f"Listing S3 objects with Prefix={kwargs['Prefix']}, StartAfter={kwargs.get('StartAfter', 'None')}")
+
+    for page in paginator.paginate(**kwargs):
+        if 'Contents' in page:
+            for obj in page['Contents']:
+                key = obj['Key']
+                
+                # Filter for new structure only: tavily_search_results/YYYYMMDD/...
+
+                # Ensure we only process keys strictly greater than last_key
+                # (StartAfter handles this, but extra safety check)
+                if last_key and key <= last_key:
+                    continue
+                yield key
+
+def lambda_handler(event, context):
+    s3 = boto3.client("s3")
+    name = event.get("name")
+
+    key = event.get("key")
+
+    date = None
+    if name:
+
+        if "_" in name:
+            name    = " ".join(name.split("_"))
+    
+    if key:
+        
+        
+        parts = key.split('/')
+        if len(parts) >= 3: 
+            name = parts[1]
+
+        if "-" in name:
+            name    = " ".join(name.split("-"))
+        
+        date = parts[2]
+
+    if not name:
+        logger.error("No name provided in event")
+        return {
+            "statusCode": 400,
+            "body": json.dumps({
+                "error": "No name provided in event"
+            })
+        }
+
+    conn = None
+
+    try:
+        conn = get_db_connection()
+        ensure_table_exists(conn)
+
+        # 1. Get the latest processed key from DB
+        last_key = get_latest_s3_key(conn , name)
+        logger.info(f"Last processed key: {last_key}")
+
+        # 2. Fetch new files from S3 starting after last_key
+        processed_count = 0
+        for key in fetch_new_files(s3, S3_BUCKET, name , last_key):
+            logger.info(f"Processing file: {key}")
+            
+            try:
+                response = s3.get_object(Bucket=S3_BUCKET, Key=key)
+                content = response['Body'].read().decode('utf-8')
+                data = json.loads(content)
+                
+                # The data structure in S3 from ingestion lambda is a list of dicts
+                if isinstance(data, list):
+                    for record in data:
+                        # Ensure record has s3_key for the DB update
+                        # We might need to inject it here if not present in the JSON
+                        # In tavily_ingestion_lambda, s3_key is not in the JSON body, 
+                        # but we need it for the 's3_key' column in DB to track progress.
+                        # Wait, insert_into_db does not take s3_key argument currently!
+                        # The previous code (tavily_search_lambda) passed s3_key separately.
+                        # The ingestion lambda does NOT include s3_key in the JSON payload (it can't, it doesn't know it yet fully when building dict).
+                        # We must update insert_into_db to take s3_key.
+                        insert_into_db(conn, record)
+                else:
+                    insert_into_db(conn, data)
+                
+                processed_count += 1
+                logger.info(f"Successfully processed {len(data) if isinstance(data, list) else 1} records from {key}")
+
+            except Exception as e:
+                logger.error(f"Failed to process record {key}: {e}")
+                continue
+        
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "message": "Processing complete", 
+                "processed_files": processed_count
+            })
+        }
+
+    except Exception as e:
+        logger.error(f"Loader execution failed: {e}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": str(e)})
+        }
+    finally:
+        if conn:
+            conn.close()
