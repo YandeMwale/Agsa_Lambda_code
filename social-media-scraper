@@ -1,0 +1,140 @@
+import os
+import json
+import boto3
+import logging
+from datetime import datetime, timezone
+
+# Configure logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+try:
+    from tavily import TavilyClient
+except ImportError:
+    TavilyClient = None
+
+# Environment Variables
+TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
+S3_BUCKET = os.environ.get("S3_BUCKET")
+
+# Target Social Media Accounts
+TARGET_ACCOUNTS = [
+    "@AccountabilityZA",
+    "@CivicActionGroup",
+    "@InvestigateNow",
+    "@ConstructionWatch"
+]
+
+def lambda_handler(event, context):
+    """
+    Lambda 1: Tavily Searcher
+    Retrieves data from Tavily based on target accounts and keywords, 
+    then saves raw JSON to S3.
+    """
+    logger.info(f"Received event: {json.dumps(event)}")
+    
+    # Handle SQS event if applicable
+    if "Records" in event:
+        try:
+            body = json.loads(event["Records"][0]["body"])
+            if "args" in body:
+                payload = body["args"]
+                payload["scan_run_id"] = body.get("scan_run_id")
+            else:
+                payload = body
+        except Exception as e:
+            logger.error(f"Error parsing SQS body: {e}")
+            payload = event
+    else:
+        payload = event
+
+    scan_run_id = payload.get("scan_run_id", datetime.now().strftime("%Y%m%d%H%M%S"))
+    keywords = payload.get("keywords", [])
+    date_range = payload.get("date_range", "Last 7 Days")
+
+    # Map date_range to Tavily time_range
+    # Tavily supports: "day", "week", "month", "year"
+    if date_range == "Last 30 Days":
+        time_range = "month"
+    else:
+        time_range = "week" # Default to 7 days/week
+    
+    if not TAVILY_API_KEY:
+        return {"statusCode": 500, "body": json.dumps({"error": "TAVILY_API_KEY not set"})}
+    
+    if not S3_BUCKET:
+        return {"statusCode": 500, "body": json.dumps({"error": "S3_BUCKET not set"})}
+
+    try:
+        tavily = TavilyClient(api_key=TAVILY_API_KEY)
+        all_results = []
+        
+        # 1. Targeted search for the 4 social accounts
+        for account in TARGET_ACCOUNTS:
+            query = f'"{account}" whistleblower corruption investigation'
+            logger.info(f"Searching Tavily for account-specific content: {query} with time_range: {time_range}")
+            
+            search_result = tavily.search(
+                query=query, 
+                search_depth="advanced",
+                max_results=5,
+                time_range=time_range
+            )
+            results = search_result.get("results", [])
+            for res in results:
+                res["target_account_reference"] = account
+            all_results.extend(results)
+
+        # 2. Broad search for keywords (if provided)
+        if keywords:
+            broad_query = f"{', '.join(keywords)} South Africa corruption whistleblower"
+            logger.info(f"Searching Tavily for broad keywords: {broad_query} with time_range: {time_range}")
+            broad_search = tavily.search(
+                query=broad_query,
+                search_depth="advanced",
+                max_results=10,
+                time_range=time_range
+            )
+            all_results.extend(broad_search.get("results", []))
+
+        # 3. Save raw results to S3
+        if all_results:
+            s3 = boto3.client("s3")
+            key = f"raw_social_searches/{scan_run_id}.json"
+            
+            payload = {
+                "scan_run_id": scan_run_id,
+                "searched_at": datetime.now(timezone.utc).isoformat(),
+                "results": all_results,
+                "metadata": {
+                    "keywords": keywords,
+                    "target_accounts": TARGET_ACCOUNTS,
+                    "date_range": date_range
+                }
+            }
+            
+            s3.put_object(
+                Bucket=S3_BUCKET,
+                Key=key,
+                Body=json.dumps(payload, default=str),
+                ContentType='application/json'
+            )
+            logger.info(f"Saved {len(all_results)} results to s3://{S3_BUCKET}/{key}")
+            
+            return {
+                "statusCode": 200,
+                "body": json.dumps({
+                    "message": "Tavily search completed and saved to S3.",
+                    "scan_run_id": scan_run_id,
+                    "result_count": len(all_results)
+                })
+            }
+        else:
+            return {
+                "statusCode": 200,
+                "body": json.dumps({"message": "No results found.", "scan_run_id": scan_run_id})
+            }
+
+    except Exception as e:
+        logger.error(f"Lambda 1 execution failed: {e}")
+        return {"statusCode": 500, "body": json.dumps({"error": str(e)})}
