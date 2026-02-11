@@ -1,0 +1,321 @@
+import os
+import json
+import boto3
+import logging
+import psycopg2
+from psycopg2.extras import Json
+from abc import ABC, abstractmethod
+from datetime import datetime
+
+# Configure logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Environment variables
+DB_HOST = os.getenv("DB_HOST", "agsa-dev-db-cluster.cluster-cxaiaiqu27x7.af-south-1.rds.amazonaws.com")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_USER = os.getenv("DB_USER", "agsaadmin")
+DB_NAME = os.getenv("DB_NAME", "agsa-content")
+DB_REGION = os.getenv("DB_REGION", "af-south-1")
+S3_BUCKET = os.getenv("S3_BUCKET", "agsa-dev-source-bucket-970103398702")
+
+def get_db_connection():
+    try:
+        import psycopg2
+    except ImportError:
+        logger.error("psycopg2 not found. Ensure it is included in the deployment package.")
+        raise
+
+    if not DB_HOST or not DB_USER:
+        raise ValueError("DB_HOST or DB_USER not set.")
+
+    # Generate RDS IAM auth token
+    rds = boto3.client("rds", region_name=DB_REGION)
+    try:
+        token = rds.generate_db_auth_token(
+            DBHostname=DB_HOST,
+            Port=DB_PORT,
+            DBUsername=DB_USER,
+        )
+    except Exception as e:
+        logger.error(f"Failed to generate DB auth token: {e}")
+        raise
+
+    try:
+        conn = psycopg2.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            user=DB_USER,
+            password=token,
+            dbname=DB_NAME,
+            sslmode="require"
+        )
+        return conn
+    except Exception as e:
+        logger.error(f"Failed to connect to DB: {e}")
+        raise
+
+class ETLStrategy(ABC):
+    def __init__(self, bucket_name):
+        self.bucket_name = bucket_name
+        self.s3 = boto3.client("s3")
+
+    @abstractmethod
+    def get_table_name(self):
+        pass
+
+    @abstractmethod
+    def get_s3_prefix(self):
+        pass
+
+    @abstractmethod
+    def parse(self, s3_key, s3_content):
+        """
+        Parses the S3 content and returns a list of dictionaries ready for insertion.
+        """
+        pass
+
+    @abstractmethod
+    def ensure_table_exists(self, conn):
+        pass
+
+    @abstractmethod
+    def insert_data(self, conn, data):
+        pass
+
+    @abstractmethod
+    def get_latest_processed_key(self , **kwargs):
+        pass
+
+    
+
+    def fetch_new_files(self, last_key):
+        """
+        Lists objects in S3 that are lexicographically greater than last_key.
+        """
+        paginator = self.s3.get_paginator('list_objects_v2')
+        # If last_key is provided, use it as a marker (StartAfter is not exactly 'marker' in v2, 
+        # but strictly speaking we want keys > last_key).
+        # list_objects_v2 'StartAfter' is useful here.
+        
+        prefix = self.get_s3_prefix()
+        kwargs = {'Bucket': self.bucket_name, 'Prefix': prefix}
+        if last_key:
+             kwargs['StartAfter'] = last_key
+
+        for page in paginator.paginate(**kwargs):
+            if 'Contents' in page:
+                for obj in page['Contents']:
+                    key = obj['Key']
+                    # Double check strictly greater (StartAfter should handle it, but being safe)
+                    if last_key and key <= last_key:
+                        continue
+                    yield key
+
+class SocialMediaETL(ETLStrategy):
+    def get_table_name(self):
+        return "social_media_test"
+
+    def get_s3_prefix(self):
+        return "social_media_sentiments/"
+
+    def get_latest_processed_key(self , conn):
+        """
+        Queries the DB to find the lexicographically largest source_key processed so far.
+        """
+        table = self.get_table_name()
+        # Note: This requires a source_key column which might not exist in all schemas.
+        # If the schema doesn't have source_key, this might fail or needs override.
+        try:
+            prefix = self.get_s3_prefix()
+            query = f"SELECT MAX(scanned_at) FROM {table}"
+            with conn.cursor() as cur:
+                cur.execute(query)
+                result = cur.fetchone()
+                if result:
+                    return self.split_datetime_no_delimiters(result[0])[0]
+        except Exception:
+            return None
+
+    @staticmethod
+    def split_datetime_no_delimiters(dt: datetime):
+        if dt is None:
+            return None, None
+
+        date_part = dt.strftime("%Y%m%d")
+        time_part = dt.strftime("%H%M%S")
+
+        return date_part, time_part
+
+    @staticmethod
+    def extract_platform(url):
+        """
+        Extracts the platform from a social media URL.
+        """
+        if "twitter.com" in url:
+            return "twitter"
+        elif "facebook.com" in url:
+            return "facebook"
+        elif "instagram.com" in url:
+            return "instagram"
+        else:
+            return "unknown"
+
+    @staticmethod
+    def format_scanned_at(scanned_at):
+        """
+        Formats the scanned_at timestamp to a string.
+        """
+        if scanned_at:
+            return datetime.fromisoformat(scanned_at.replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M:%S")
+        return None
+
+    @staticmethod
+    def split_iso_datetime(iso_string):
+        """
+        Splits an ISO 8601 datetime string into date and time parts.
+        Returns a tuple (date_str, time_str).
+        """
+        if not iso_string:
+            return None, None
+        try:
+            # Handle 'Z' for UTC if present, as fromisoformat might not support it in all versions
+            if iso_string.endswith('Z'):
+                iso_string = iso_string[:-1] + '+00:00'
+            
+            dt = datetime.fromisoformat(iso_string)
+            return str(dt.date()).replace("-" , ""), str(dt.time()).replace(":" , "")
+        except ValueError:
+            logger.warning(f"Could not parse ISO string: {iso_string}")
+            return None, None
+
+    def parse(self, s3_key, s3_content):
+        try:
+            json_content = json.loads(s3_content)
+            results = json_content.get("results", [])
+            parsed_data = []
+            
+            for item in results:
+                # Map Tavily/Source result to DB schema
+                content = item.get("content", "")
+                
+                parsed_item = {
+                    "username": item.get("username" , "unknown"),
+                    "platform": self.extract_platform(item.get("url")),
+                    "location": item.get("location"),
+                    "content": content,
+                    "posted_at": item.get("published_date"),
+                    "riskScore": item.get("score"),
+                    "lifestyleScore": item.get("score"),
+                    "detectedItems": item.get("detectedItems"),
+                    "imageURL": item.get("url"),
+                    "scanned_at": item.get("scanned_at") or datetime.utcnow().isoformat(),
+                }
+                parsed_data.append(parsed_item)
+            
+            return parsed_data
+        except Exception as e:
+            logger.error(f"Failed to parse {s3_key}: {e}")
+            return []
+
+    def ensure_table_exists(self, conn):
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self.get_table_name()} (
+                    id SERIAL PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    platform VARCHAR(255) NOT NULL,
+                    location VARCHAR(255),
+                    content TEXT,
+                    posted_at TIMESTAMP,
+                    scanned_at TIMESTAMP,
+                    riskScore INT,
+                    lifestyleScore INT,
+                    detectedItems TEXT[],
+                    imageURL VARCHAR(255)
+                );
+            """)
+            conn.commit()
+
+    def insert_data(self, conn, data):
+        if not data:
+            return
+        
+        table = self.get_table_name()
+        with conn.cursor() as cur:
+            query = f"""
+                INSERT INTO {table} (
+                    username, platform, location, content, posted_at, scanned_at, riskScore, lifestyleScore, detectedItems, imageURL
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            for item in data:
+                cur.execute(query, (
+                    item.get("username"),
+                    item.get("platform"),
+                    item.get("location"),
+                    item.get("content"),
+                    item.get("posted_at"),
+                    item.get("scanned_at"),
+                    item.get("riskScore"),
+                    item.get("lifestyleScore"),
+                    item.get("detectedItems"),
+                    item.get("imageURL")
+                ))
+
+def lambda_handler(event, context):
+    conn = None
+    try:
+        conn = get_db_connection()
+        conn.autocommit = True
+        
+        strategies = [
+            SocialMediaETL(S3_BUCKET)
+        ]
+        
+        results = {}
+        
+        for strategy in strategies:
+            strategy.ensure_table_exists(conn)
+            strategy_name = strategy.__class__.__name__
+            logger.info(f"Starting {strategy_name}")
+            
+            last_key = strategy.get_latest_processed_key(conn)
+            last_key = None
+            logger.info(f"Last processed key for {strategy_name}: {last_key}")
+            
+            processed_count = 0
+            for key in strategy.fetch_new_files(last_key):
+                logger.info(f"Processing {key}")
+                
+                # Fetch S3 Object
+                response = strategy.s3.get_object(Bucket=strategy.bucket_name, Key=key)
+                content = response['Body'].read().decode('utf-8')
+                
+                # Parse
+                data = strategy.parse(key, content)
+
+                # Insert
+                if data:
+                    strategy.insert_data(conn, data)
+                    processed_count += len(data)
+            
+            results[strategy_name] = f"Processed {processed_count} records"
+            
+        return {
+            "statusCode": 200,
+            "body": json.dumps(results)
+        }
+
+    except Exception as e:
+        logger.error(f"ETL Job failed: {e}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": str(e)})
+        }
+    finally:
+        if conn:
+            conn.close()
+
+if __name__ == "__main__":
+    # Local testing
+    print(lambda_handler({}, {}))
